@@ -1,2 +1,2 @@
-portredirector: portredirector.c
+portredirector:
 	gcc -o portredirector portredirector.c
