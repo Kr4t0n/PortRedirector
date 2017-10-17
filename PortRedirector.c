@@ -4,20 +4,18 @@
 #include <netdb.h>
 #include <string.h>
 #include <stdio.h>
-#include <getopt.h>
-#include <pthread.h>
-#include <arpa/inet.h>
+#include <stdlib.h>
+#include <signal.h>
 
+#define END(message) perror(message); exit(1);
 #define BUF_SIZE 4096
 #define QUEUE_SIZE 100
 
 short sourceport = 0;
 short targetport = 0;
 
-pthread_mutex_t conp_mutex;
-
-void dealonereq(void *arg);
-int connectserver();
+void dealonereq(int client_socket);
+void communicate(int src, int dst);
 
 int main(int argc, char **argv) {
     if(argc != 3) {
@@ -33,104 +31,109 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    struct sockaddr_in client_addr, target_addr;
+    signal(SIGCHLD,  SIG_IGN);
+    struct sockaddr_in client_address, server_address;
     socklen_t sin_size = sizeof(struct sockaddr_in);
-    int sockfd, accept_sockfd, on = 1;
-    pthread_t Clitid;
+    int listen_socket, client_socket;
+    pid_t up_pid;
 
-    sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if(sockfd < 0) {
-        printf("Socket failed...Abort...\n");
-        return -1;
+    listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if(listen_socket == -1) {
+        END("Socket failed...Abort...");
     }
 
-    memset(&target_addr, 0, sizeof(target_addr));
-    target_addr.sin_family = AF_INET;
-    target_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    target_addr.sin_port = htons(sourceport);
+    bzero((char *) &server_address, sizeof(server_address));
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_address.sin_port = htons(sourceport);
 
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *) &on, sizeof(on));
-
-    if(bind(sockfd, (struct sockaddr *) &target_addr, sizeof(target_addr)) < 0) {
-        printf("Bind failed...Abort...\n");
-        return -1;
+    if(bind(listen_socket, (struct sockaddr *) &server_address, sizeof(server_address)) == -1) {
+        END("Bind failed");
     }
-    if(listen(sockfd, QUEUE_SIZE) < 0) {
-        printf("Listen failed...Abort...\n");
-        return -1;
+    if(listen(listen_socket, QUEUE_SIZE) == -1) {
+        END("Listen failed");
     }
     while(1) {
-        accept_sockfd = accept(sockfd, (struct sockaddr *) &client_addr, &sin_size);
-        if(accept_sockfd <= 0) {
-            printf("accept failed\n");
-            continue;
+        client_socket = accept(listen_socket, NULL, NULL);
+
+        if(client_socket == -1) {
+            END("accept failed");
         }
-        printf("Received a request from %s: %u\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-        pthread_create(&Clitid, NULL, (void *) dealonereq, (void *) accept_sockfd);
+        
+        up_pid = fork();
+
+        if(up_pid == -1) {
+            END("fork failed");
+        }
+
+        if(up_pid == 0) {
+            dealonereq(client_socket);
+            exit(1);
+        }
+
+        close(client_socket);
     }
+
     return 0;
 }
 
-void dealonereq(void *arg) {
-    char buf[BUF_SIZE];
-    char recvbuf[BUF_SIZE];
-    int bytes;
-    int accept_sockfd;
-    int remotesocket;
+void dealonereq(int client_socket) {
+    int forward_socket;
+    struct sockaddr_in forward_address;
+    pid_t down_pid;
 
-    accept_sockfd = (int) arg;
-    pthread_detach(pthread_self());
-    bzero(buf, BUF_SIZE);
-    bzero(recvbuf, BUF_SIZE);
-    bytes = read(accept_sockfd, buf, BUF_SIZE);
-    if(bytes <= 0) {
-        printf("Cannot read from accept_sockfd\n");
-        close(accept_sockfd);
-        return;
+    forward_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+    if(forward_socket == -1) {
+        END("forward socket failed");
     }
 
-    remotesocket = connectserver();
-    if(remotesocket == -1) {
-        printf("Cannot connect to targetport\n");
-        close(accept_sockfd);
-        return;
-    }
-    send(remotesocket, buf, bytes, 0);
-    while(1) {
-        int readSizeOnce = 0;
-        readSizeOnce = read(remotesocket, recvbuf, BUF_SIZE);
+    bzero((char *) &forward_address, sizeof(forward_address));
+    forward_address.sin_family = AF_INET;
+    forward_address.sin_addr.s_addr = inet_addr("127.0.0.1");
+    forward_address.sin_port = htons(targetport);
 
-        if(readSizeOnce <= 0) {
-            break;
-        }
-        send(accept_sockfd, recvbuf, readSizeOnce, 0);
+    if(connect(forward_socket, (struct sockaddr *) &forward_address, sizeof(forward_address)) == -1) {
+        END("forward connect failed");
     }
-    close(remotesocket);
-    close(accept_sockfd);
+
+    down_pid = fork();
+
+    if(down_pid == -1) {
+        END("fork failed");
+    }
+
+    if(down_pid == 0){
+        communicate(forward_socket, client_socket);
+    }
+    else {
+        communicate(client_socket, forward_socket);
+    }
 }
 
-int connectserver() {
-    int cnt_stat;
-    struct sockaddr_in server_addr;
-    int remotesocket;
-    remotesocket = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if(remotesocket < 0) {
-        printf("Cannot create socket!\n");
-        return -1;
-    }
-    memset(&server_addr, 0 ,sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(targetport);
-    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+void communicate(int src, int dst) {
+    char buf[BUF_SIZE];
+    int r, i, j;
 
-    cnt_stat = connect(remotesocket, (struct sockaddr *) &server_addr, sizeof(server_addr));
-    if(cnt_stat < 0) {
-        printf("remote connect failed\n");
-        close(remotesocket);
-        return -1;
+    r = read(src, buf, BUF_SIZE);
+    while(r > 0) {
+        i = 0;
+        while(i < r) {
+            j = write(dst, buf + i, r - i);
+            if (j == -1) {
+                END("write failed");
+            }
+            i += j;
+        }
+        r = read(src, buf, BUF_SIZE);
     }
-    else
-        printf("connected remote server--------------->%s: %u.\n", inet_ntoa(server_addr.sin_addr), ntohs(server_addr.sin_port));
+    if (r == -1) {
+        END("read failed");
+    }
 
-    return remotesocket;
+    shutdown(src, SHUT_RD);
+    shutdown(dst, SHUT_WR);
+    close(src);
+    close(dst);
+    exit(0);  
 }
