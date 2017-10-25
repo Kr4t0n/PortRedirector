@@ -18,7 +18,7 @@ make
 
 # Usage
 ```bash
-./portscanner portA portB
+./portredirector portA portB
 ```
 
 # Example
